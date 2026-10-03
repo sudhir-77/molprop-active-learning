@@ -9,6 +9,42 @@ from torch import nn
 from molprop.featurize import MolGraph
 
 
+def segment_sum(values: torch.Tensor, index: torch.Tensor, n_segments: int) -> torch.Tensor:
+    """Sum rows into buckets without atomic adds.
+
+    Rows are sorted by bucket, cumulatively summed, and written once per bucket.
+    That matches `index_add` and stays valid under deterministic PyTorch mode.
+    """
+    squeezed = values.ndim == 1
+    if squeezed:
+        values = values.unsqueeze(1)
+    n_rows, width = int(values.shape[0]), int(values.shape[1])
+    if n_rows == 0 or n_segments == 0:
+        out = values.new_zeros((n_segments, width))
+        return out.squeeze(1) if squeezed else out
+    index = index.to(dtype=torch.long)
+    order = torch.argsort(index, stable=True)
+    index_sorted = index.index_select(0, order)
+    cumulative = torch.cumsum(values.index_select(0, order), dim=0)
+    if n_rows == 1:
+        end_pos = torch.zeros(1, dtype=torch.long, device=values.device)
+    else:
+        changed = index_sorted.narrow(0, 1, n_rows - 1) != index_sorted.narrow(0, 0, n_rows - 1)
+        end_flags = torch.empty(n_rows, dtype=torch.bool, device=values.device)
+        end_flags[:-1] = changed
+        end_flags[-1] = True
+        end_pos = torch.arange(n_rows, device=values.device)[end_flags]
+    group_end = cumulative.index_select(0, end_pos)
+    if group_end.shape[0] == 1:
+        summed = group_end
+    else:
+        previous = torch.cat([group_end.new_zeros(1, width), group_end[:-1]], dim=0)
+        summed = group_end - previous
+    segment_ids = index_sorted.index_select(0, end_pos)
+    out = values.new_zeros((n_segments, width)).index_copy(0, segment_ids, summed)
+    return out.squeeze(1) if squeezed else out
+
+
 class DMPNN(nn.Module):
     """Edge-centered message passing with a Morgan fingerprint readout branch.
 
@@ -27,22 +63,29 @@ class DMPNN(nn.Module):
         fp_dim: int = 2048,
         desc_dim: int = 10,
         dropout: float = 0.1,
+        use_descriptors: bool = True,
     ) -> None:
         super().__init__()
         if depth < 1:
             raise ValueError("depth must be at least 1")
+        if use_descriptors and desc_dim < 1:
+            raise ValueError("desc_dim must be positive when descriptors are used")
         self.hidden = hidden
         self.depth = depth
         self.fp_dim = fp_dim
-        self.desc_dim = desc_dim
+        self.desc_dim = desc_dim if use_descriptors else 0
+        self.use_descriptors = use_descriptors
         self.edge_init = nn.Linear(atom_dim + bond_dim, hidden)
         self.edge_update = nn.Linear(hidden, hidden)
         self.atom_out = nn.Linear(atom_dim + hidden, hidden)
         self.fp_proj = nn.Sequential(nn.Linear(fp_dim, hidden), nn.ReLU(), nn.Dropout(dropout))
-        self.desc_skip = nn.Linear(desc_dim, 1)
-        nn.init.zeros_(self.desc_skip.weight)
-        nn.init.zeros_(self.desc_skip.bias)
-        readout_in = hidden * 3 + desc_dim
+        if use_descriptors:
+            self.desc_skip = nn.Linear(desc_dim, 1)
+            nn.init.zeros_(self.desc_skip.weight)
+            nn.init.zeros_(self.desc_skip.bias)
+        else:
+            self.desc_skip = None
+        readout_in = hidden * 3 + (desc_dim if use_descriptors else 0)
         self.graph_norm = nn.LayerNorm(readout_in)
         self.readout = nn.Sequential(
             nn.Linear(readout_in, hidden * 2),
@@ -67,21 +110,25 @@ class DMPNN(nn.Module):
             raise ValueError(f"expected fingerprint width {self.fp_dim}, got {fp.shape[1]}")
         messages = self._atom_messages(atom_x, bond_x, src, dst, rev)
         atom_h = torch.relu(self.atom_out(torch.cat([atom_x, messages], dim=-1)))
-        sum_pool = atom_h.new_zeros(n_graphs, self.hidden)
-        sum_pool.index_add_(0, graph_index, atom_h)
-        counts = atom_h.new_zeros(n_graphs)
-        counts.index_add_(
-            0,
-            graph_index,
+        sum_pool = segment_sum(atom_h, graph_index, n_graphs)
+        counts = segment_sum(
             torch.ones(atom_h.size(0), device=atom_h.device, dtype=atom_h.dtype),
+            graph_index,
+            n_graphs,
         )
         mean_pool = sum_pool / counts.clamp(min=1.0).unsqueeze(1)
         fp_h = self.fp_proj(fp)
-        desc = batch["desc"]
-        if desc.shape[1] != self.desc_dim:
-            raise ValueError(f"expected descriptor width {self.desc_dim}, got {desc.shape[1]}")
-        graph_h = self.graph_norm(torch.cat([sum_pool, mean_pool, fp_h, desc], dim=-1))
-        return self.readout(graph_h).squeeze(-1) + self.desc_skip(desc).squeeze(-1)
+        parts = [sum_pool, mean_pool, fp_h]
+        skip = atom_h.new_zeros(n_graphs)
+        if self.use_descriptors:
+            desc = batch["desc"]
+            if desc.shape[1] != self.desc_dim:
+                raise ValueError(f"expected descriptor width {self.desc_dim}, got {desc.shape[1]}")
+            parts.append(desc)
+            assert self.desc_skip is not None
+            skip = self.desc_skip(desc).squeeze(-1)
+        graph_h = self.graph_norm(torch.cat(parts, dim=-1))
+        return self.readout(graph_h).squeeze(-1) + skip
 
     def _atom_messages(
         self,
@@ -95,14 +142,12 @@ class DMPNN(nn.Module):
             return atom_x.new_zeros(atom_x.size(0), self.hidden)
         h0 = torch.relu(self.edge_init(torch.cat([atom_x[src], bond_x], dim=-1)))
         h = h0
+        n_atoms = int(atom_x.size(0))
         for _ in range(self.depth):
-            incoming = h.new_zeros(atom_x.size(0), self.hidden)
-            incoming.index_add_(0, dst, h)
+            incoming = segment_sum(h, dst, n_atoms)
             gathered = incoming[src] - h[rev]
             h = torch.relu(h0 + self.edge_update(gathered))
-        atom_messages = h.new_zeros(atom_x.size(0), self.hidden)
-        atom_messages.index_add_(0, dst, h)
-        return atom_messages
+        return segment_sum(h, dst, n_atoms)
 
 
 def collate_graphs(graphs: list[MolGraph], device: torch.device) -> dict[str, torch.Tensor]:

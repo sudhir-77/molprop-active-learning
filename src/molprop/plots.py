@@ -16,7 +16,7 @@ def plot_rmse_curve(frame: pd.DataFrame, path: Path) -> None:
     fig, axes = plt.subplots(1, len(datasets), figsize=(4.8 * len(datasets), 4.0), squeeze=False)
     for axis, dataset in zip(axes[0], datasets):
         subset = frame[frame["dataset"] == dataset]
-        for model, style in (("gnn", "-o"), ("rf_baseline", "--s")):
+        for model, style in (("gnn", "-o"), ("rf_fp_desc", "--s"), ("rf_baseline", ":^")):
             part = subset[subset["model"] == model].sort_values("train_size")
             if part.empty:
                 continue

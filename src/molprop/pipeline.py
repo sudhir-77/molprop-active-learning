@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import argparse
-import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,6 +13,7 @@ import torch
 
 from molprop.active_learning import (
     best_strategy_ratio,
+    ratios_vs_random,
     recoveries_at_budget,
     recovery_points,
     run_pool_simulation,
@@ -43,7 +43,7 @@ from molprop.report import (
     write_split_csv,
 )
 from molprop.split import assert_split_integrity, assign_splits
-from molprop.train import ensemble_predict_from_states, seed_everything, train_ensemble
+from molprop.train import configure_runtime, ensemble_predict_from_states, seed_everything, train_ensemble
 
 
 @dataclass
@@ -81,7 +81,7 @@ def take_subset(
 ) -> tuple[pd.DataFrame, list[MolGraph]]:
     if n >= len(frame):
         return frame.reset_index(drop=True), graphs
-    rng = np.random.RandomState(seed)
+    rng = np.random.default_rng(seed)
     chosen = np.sort(rng.choice(len(frame), size=n, replace=False))
     subset = frame.iloc[chosen].reset_index(drop=True)
     kept = [graphs[int(i)] for i in chosen]
@@ -117,13 +117,18 @@ def assert_prediction_matches_split(split_path: Path, prediction_path: Path) -> 
         raise ValueError(f"{prediction_path.name} ids do not match the test split")
 
 
-def fit_supervised(ds: Prepared, cfg: RunConfig, results_dir: Path, device: torch.device) -> dict:
-    """Train on the train split, stop on validation, and score the frozen test split."""
+def _fit_gnn(
+    ds: Prepared,
+    cfg: RunConfig,
+    device: torch.device,
+    *,
+    use_descriptors: bool,
+    log_prefix: str,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
+    """Train one ensemble. Returns test mean, calibrated test std, val mean, and std scale."""
     train_graphs, y_train, _, _ = ds.part("train")
     val_graphs, y_val, _, _ = ds.part("val")
-    test_graphs, y_test, test_ids, _ = ds.part("test")
-    if set(test_ids) & set(ds.frame.loc[ds.frame["split"] == "train", "id"].astype(str)):
-        raise RuntimeError("test ids leaked into the training ids")
+    test_graphs, _, _, _ = ds.part("test")
     mu_test, std_test, states, y_mean, y_scale = train_ensemble(
         train_graphs,
         y_train,
@@ -133,42 +138,103 @@ def fit_supervised(ds: Prepared, cfg: RunConfig, results_dir: Path, device: torc
         cfg,
         cfg.ensemble_seeds,
         device,
-        log_prefix=f"{ds.name} gnn",
+        log_prefix=log_prefix,
+        use_descriptors=use_descriptors,
     )
     mu_val, std_val = ensemble_predict_from_states(
-        states, train_graphs[0], val_graphs, y_mean, y_scale, cfg, device
+        states,
+        train_graphs[0],
+        val_graphs,
+        y_mean,
+        y_scale,
+        cfg,
+        device,
+        use_descriptors=use_descriptors,
     )
     scale = fit_std_scale(y_val, mu_val, std_val)
     std_test = std_test * scale
     std_val = std_val * scale
     print(
-        f"{ds.name} gnn val_rmse {rmse(y_val, mu_val):.4f} "
+        f"{log_prefix} val_rmse {rmse(y_val, mu_val):.4f} "
         f"val_coverage {interval_coverage(y_val, mu_val, std_val):.4f} std_scale {scale:.3f}",
         flush=True,
     )
-    forest = train_random_forest(train_graphs, y_train, n_trees=cfg.rf_trees, seed=cfg.seed)
-    rf_test = predict_random_forest(forest, test_graphs)
-    rf_val = predict_random_forest(forest, val_graphs)
-    print(
-        f"{ds.name} rf val_rmse {rmse(y_val, rf_val):.4f} heldout_rows {len(test_ids)}",
-        flush=True,
+    return mu_test, std_test, mu_val, float(scale)
+
+
+def _fit_forest(
+    ds: Prepared,
+    cfg: RunConfig,
+    *,
+    include_descriptors: bool,
+    label: str,
+) -> tuple[np.ndarray, float]:
+    train_graphs, y_train, _, _ = ds.part("train")
+    val_graphs, y_val, _, _ = ds.part("val")
+    test_graphs, _, _, _ = ds.part("test")
+    forest = train_random_forest(
+        train_graphs,
+        y_train,
+        n_trees=cfg.rf_trees,
+        seed=cfg.seed,
+        include_descriptors=include_descriptors,
     )
+    rf_test = predict_random_forest(forest, test_graphs, include_descriptors=include_descriptors)
+    rf_val = predict_random_forest(forest, val_graphs, include_descriptors=include_descriptors)
+    val_rmse = rmse(y_val, rf_val)
+    print(f"{ds.name} {label} val_rmse {val_rmse:.4f}", flush=True)
+    return rf_test, val_rmse
+
+
+def fit_supervised(ds: Prepared, cfg: RunConfig, results_dir: Path, device: torch.device) -> dict:
+    """Train on the train split, stop on validation, and score the frozen test split."""
+    _, _, train_ids, _ = ds.part("train")
+    _, y_val, _, _ = ds.part("val")
+    _, y_test, test_ids, _ = ds.part("test")
+    if set(test_ids) & set(train_ids):
+        raise RuntimeError("test ids leaked into the training ids")
+    mu_test, std_test, mu_val, scale = _fit_gnn(
+        ds, cfg, device, use_descriptors=True, log_prefix=f"{ds.name} gnn"
+    )
+    mu_ablate, std_ablate, mu_val_ablate, scale_ablate = _fit_gnn(
+        ds, cfg, device, use_descriptors=False, log_prefix=f"{ds.name} gnn_no_desc"
+    )
+    rf_test, rf_val = _fit_forest(ds, cfg, include_descriptors=False, label="rf_fp")
+    rf_desc_test, rf_desc_val = _fit_forest(ds, cfg, include_descriptors=True, label="rf_fp_desc")
+    print(f"{ds.name} heldout_rows {len(test_ids)}", flush=True)
     split_path = results_dir / "splits" / f"{ds.name}_split.csv"
-    gnn_path = results_dir / "predictions" / f"{ds.name}_gnn_ensemble_test.csv"
-    rf_path = results_dir / "predictions" / f"{ds.name}_rf_baseline_test.csv"
+    paths = {
+        "gnn_ensemble": results_dir / "predictions" / f"{ds.name}_gnn_ensemble_test.csv",
+        "gnn_no_desc": results_dir / "predictions" / f"{ds.name}_gnn_no_desc_test.csv",
+        "rf_baseline": results_dir / "predictions" / f"{ds.name}_rf_baseline_test.csv",
+        "rf_fp_desc": results_dir / "predictions" / f"{ds.name}_rf_fp_desc_test.csv",
+    }
     write_split_csv(split_path, ds.frame)
     reloaded = pd.read_csv(split_path, keep_default_na=False)
     assert_split_integrity(reloaded)
-    write_prediction_csv(gnn_path, test_ids, y_test, mu_test, std_test)
-    write_prediction_csv(rf_path, test_ids, y_test, rf_test, None)
-    assert_prediction_matches_split(split_path, gnn_path)
-    assert_prediction_matches_split(split_path, rf_path)
-    gnn_metrics = prediction_metrics(gnn_path, with_coverage=True)
-    rf_metrics = prediction_metrics(rf_path, with_coverage=False)
+    write_prediction_csv(paths["gnn_ensemble"], test_ids, y_test, mu_test, std_test)
+    write_prediction_csv(paths["gnn_no_desc"], test_ids, y_test, mu_ablate, std_ablate)
+    write_prediction_csv(paths["rf_baseline"], test_ids, y_test, rf_test, None)
+    write_prediction_csv(paths["rf_fp_desc"], test_ids, y_test, rf_desc_test, None)
+    for path in paths.values():
+        assert_prediction_matches_split(split_path, path)
+    gnn_metrics = prediction_metrics(paths["gnn_ensemble"], with_coverage=True)
+    ablate_metrics = prediction_metrics(paths["gnn_no_desc"], with_coverage=True)
+    rf_metrics = prediction_metrics(paths["rf_baseline"], with_coverage=False)
+    rf_desc_metrics = prediction_metrics(paths["rf_fp_desc"], with_coverage=False)
     gnn_metrics["val_rmse"] = rmse(y_val, mu_val)
-    rf_metrics["val_rmse"] = rmse(y_val, rf_val)
+    ablate_metrics["val_rmse"] = rmse(y_val, mu_val_ablate)
+    rf_metrics["val_rmse"] = rf_val
+    rf_desc_metrics["val_rmse"] = rf_desc_val
     gnn_metrics["std_scale"] = float(scale)
-    return {"gnn_ensemble": gnn_metrics, "rf_baseline": rf_metrics, "split_path": split_path}
+    ablate_metrics["std_scale"] = float(scale_ablate)
+    return {
+        "gnn_ensemble": gnn_metrics,
+        "gnn_no_desc": ablate_metrics,
+        "rf_baseline": rf_metrics,
+        "rf_fp_desc": rf_desc_metrics,
+        "split_path": split_path,
+    }
 
 
 def learning_curve_rows(ds: Prepared, cfg: RunConfig, device: torch.device) -> list[dict]:
@@ -180,7 +246,7 @@ def learning_curve_rows(ds: Prepared, cfg: RunConfig, device: torch.device) -> l
     train_graphs, y_train, _, _ = ds.part("train")
     val_graphs, y_val, _, _ = ds.part("val")
     test_graphs, y_test, _, _ = ds.part("test")
-    rng = np.random.RandomState(cfg.seed)
+    rng = np.random.default_rng(cfg.seed)
     order = rng.permutation(len(train_graphs))
     rows: list[dict] = []
     for fraction in cfg.curve_fractions:
@@ -207,16 +273,26 @@ def learning_curve_rows(ds: Prepared, cfg: RunConfig, device: torch.device) -> l
                 "test_rmse": rmse(y_test, mu),
             }
         )
-        forest = train_random_forest(subset, subset_y, n_trees=cfg.rf_trees, seed=cfg.seed)
-        rf_pred = predict_random_forest(forest, test_graphs)
-        rows.append(
-            {
-                "dataset": ds.name,
-                "model": "rf_baseline",
-                "train_size": int(size),
-                "test_rmse": rmse(y_test, rf_pred),
-            }
-        )
+        for include_descriptors, model_name in (
+            (False, "rf_baseline"),
+            (True, "rf_fp_desc"),
+        ):
+            forest = train_random_forest(
+                subset,
+                subset_y,
+                n_trees=cfg.rf_trees,
+                seed=cfg.seed,
+                include_descriptors=include_descriptors,
+            )
+            rf_pred = predict_random_forest(forest, test_graphs, include_descriptors=include_descriptors)
+            rows.append(
+                {
+                    "dataset": ds.name,
+                    "model": model_name,
+                    "train_size": int(size),
+                    "test_rmse": rmse(y_test, rf_pred),
+                }
+            )
     return rows
 
 
@@ -248,6 +324,7 @@ def run_lipophilicity_active_learning(ds: Prepared, cfg: RunConfig, device: torc
         fixed_mean = None if state is None else state["y_mean"]
         fixed_scale = None if state is None else state["y_scale"]
         epochs = cfg.al_epochs if state is None else cfg.al_warm_epochs
+        member_seeds = tuple(calls["n"] * 100 + member for member in range(cfg.al_ensemble_size))
         mu, std, members, y_mean, y_scale = train_ensemble(
             [graph_by_id[mol_id] for mol_id in labeled_ids],
             y,
@@ -255,7 +332,7 @@ def run_lipophilicity_active_learning(ds: Prepared, cfg: RunConfig, device: torc
             None,
             [graph_by_id[mol_id] for mol_id in candidate_ids],
             cfg,
-            seeds=tuple(range(cfg.al_ensemble_size)),
+            seeds=member_seeds,
             device=device,
             epochs=epochs,
             min_epochs=1,
@@ -305,13 +382,13 @@ def run_pipeline(
     started = time.perf_counter()
     cfg = make_config(quick)
     torch_device = resolve_device(device)
-    torch.set_num_threads(max(1, os.cpu_count() or 1))
+    torch_threads = configure_runtime()
     seed_everything(cfg.seed)
     data_path = data_dir if data_dir is not None else project_root / "data"
     results_path = results_dir if results_dir is not None else project_root / "results"
     data_path.mkdir(parents=True, exist_ok=True)
     results_path.mkdir(parents=True, exist_ok=True)
-    hardware = collect_hardware(torch_device)
+    hardware = collect_hardware(torch_device, torch_threads=torch_threads)
     print(f"device {torch_device} python {hardware['python']} cpu {hardware['cpu']}", flush=True)
 
     prepared = {name: prepare_dataset(name, cfg, data_path) for name in ("esol", "lipophilicity")}
@@ -358,15 +435,19 @@ def run_pipeline(
         }
         metrics_body[name] = {
             "gnn_ensemble": block["gnn_ensemble"],
+            "gnn_no_desc": block["gnn_no_desc"],
             "rf_baseline": block["rf_baseline"],
+            "rf_fp_desc": block["rf_fp_desc"],
             "dropped_smiles": len(prepared[name].dropped),
         }
+    strategy_ratios = ratios_vs_random(means)
     metrics_body["active_learning"] = {
         "budget_fraction": cfg.al_budget_fraction,
         "pool_size": int(len(pool)),
         "pool_excludes_test_split": True,
         "hit_recovery_mean": means,
         "hit_recovery_by_seed": recoveries,
+        "ratio_vs_random": strategy_ratios,
         "best_strategy": best_name,
         "best_over_random": ratio,
         "kappa": cfg.al_kappa,
@@ -376,13 +457,13 @@ def run_pipeline(
         build_rmse_criterion(
             "ESOL test RMSE (scaffold split)",
             metrics_body["esol"]["gnn_ensemble"]["test_rmse"],
-            metrics_body["esol"]["rf_baseline"]["test_rmse"],
+            metrics_body["esol"]["rf_fp_desc"]["test_rmse"],
             0.90,
         ),
         build_rmse_criterion(
             "Lipophilicity test RMSE (scaffold split)",
             metrics_body["lipophilicity"]["gnn_ensemble"]["test_rmse"],
-            metrics_body["lipophilicity"]["rf_baseline"]["test_rmse"],
+            metrics_body["lipophilicity"]["rf_fp_desc"]["test_rmse"],
             0.85,
         ),
         build_coverage_criterion(
@@ -398,6 +479,8 @@ def run_pipeline(
         "success_criteria": criteria,
         "metrics": metrics_body,
         "baseline": {
+            "esol_rf_fp_desc_test_rmse": metrics_body["esol"]["rf_fp_desc"]["test_rmse"],
+            "lipophilicity_rf_fp_desc_test_rmse": metrics_body["lipophilicity"]["rf_fp_desc"]["test_rmse"],
             "esol_rf_test_rmse": metrics_body["esol"]["rf_baseline"]["test_rmse"],
             "lipophilicity_rf_test_rmse": metrics_body["lipophilicity"]["rf_baseline"]["test_rmse"],
             "active_learning_random_hit_recovery": means["random"],

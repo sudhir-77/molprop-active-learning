@@ -19,7 +19,7 @@ RESULTS_END = "<!-- RESULTS_END -->"
 FORBIDDEN_WORDS = ("leveraged", "robust", "cutting-edge", "seamless", "spearheaded")
 
 
-def collect_hardware(device: torch.device) -> dict:
+def collect_hardware(device: torch.device, torch_threads: int | None = None) -> dict:
     ram_gb = 0.0
     try:
         if sys.platform == "win32":
@@ -51,12 +51,14 @@ def collect_hardware(device: torch.device) -> dict:
     gpu = None
     if device.type == "cuda" and torch.cuda.is_available():
         gpu = torch.cuda.get_device_name(0)
+    threads = int(torch.get_num_threads() if torch_threads is None else torch_threads)
     return {
         "cpu": platform.processor() or platform.machine(),
         "ram_gb": ram_gb,
         "gpu": gpu,
         "python": platform.python_version(),
         "os": platform.platform(),
+        "torch_threads": threads,
     }
 
 
@@ -184,28 +186,39 @@ def render_results_markdown(metrics: dict) -> str:
     lines.extend(
         [
             "",
-            "| Dataset | GNN ensemble test RMSE | RF baseline test RMSE | 90% interval coverage |",
-            "|---|---:|---:|---:|",
+            "| Dataset | GNN ensemble | GNN without descriptors | RF fingerprint + descriptors | RF fingerprint | 90% interval coverage |",
+            "|---|---:|---:|---:|---:|---:|",
         ]
     )
     for dataset in ("esol", "lipophilicity"):
         block = metrics["metrics"][dataset]
         lines.append(
-            "| {name} | {gnn:.4f} | {rf:.4f} | {cov:.4f} |".format(
+            "| {name} | {gnn:.4f} | {ablate:.4f} | {rf_desc:.4f} | {rf:.4f} | {cov:.4f} |".format(
                 name=dataset,
                 gnn=block["gnn_ensemble"]["test_rmse"],
+                ablate=block["gnn_no_desc"]["test_rmse"],
+                rf_desc=block["rf_fp_desc"]["test_rmse"],
                 rf=block["rf_baseline"]["test_rmse"],
                 cov=block["gnn_ensemble"]["coverage_90"],
             )
         )
     active = metrics["metrics"]["active_learning"]
-    recovery = ", ".join(f"{name} {value:.4f}" for name, value in active["hit_recovery_mean"].items())
+    lines.extend(
+        [
+            "",
+            "Top-5% hit recovery on the lipophilicity pool at a 20% evaluation budget, mean over seeds. The ratio is that recovery divided by random acquisition.",
+            "",
+            "| Strategy | Top-5% hit recovery | Ratio vs random |",
+            "|---|---:|---:|",
+        ]
+    )
+    for name, value in active["hit_recovery_mean"].items():
+        lines.append(f"| {name} | {value:.4f} | {active['ratio_vs_random'][name]:.4f} |")
     lines.extend(
         [
             "",
             (
-                "Active learning at a 20% budget, mean over seeds: "
-                f"{recovery}. Best strategy {active['best_strategy']} is "
+                f"Best strategy {active['best_strategy']} is "
                 f"{active['best_over_random']:.4f} times random."
             ),
             "",
@@ -235,9 +248,10 @@ def write_resume_notes(metrics: dict, path: Path) -> None:
     lipo = metrics["metrics"]["lipophilicity"]
     active = metrics["metrics"]["active_learning"]
     esol_rmse = esol["gnn_ensemble"]["test_rmse"]
+    esol_rf_desc = esol["rf_fp_desc"]["test_rmse"]
     esol_rf = esol["rf_baseline"]["test_rmse"]
     lipo_rmse = lipo["gnn_ensemble"]["test_rmse"]
-    lipo_rf = lipo["rf_baseline"]["test_rmse"]
+    lipo_rf_desc = lipo["rf_fp_desc"]["test_rmse"]
     esol_cov = esol["gnn_ensemble"]["coverage_90"]
     lipo_cov = lipo["gnn_ensemble"]["coverage_90"]
     ratio = active["best_over_random"]
@@ -258,9 +272,9 @@ Python, PyTorch, RDKit, scikit-learn, pandas, matplotlib, pytest, graph neural n
 
 ## Draft bullets
 
-- Built a message-passing GNN ensemble in PyTorch for molecular property prediction, reaching {esol_rmse:.3f} RMSE on scaffold-split ESOL vs. {esol_rf:.3f} for a fingerprint random forest.
-- Predicted lipophilicity on a Bemis-Murcko scaffold split with ensemble test RMSE {lipo_rmse:.3f} vs. {lipo_rf:.3f} for the fingerprint random forest.
-- Ran an active-learning screening loop whose best strategy ({best}) recovered {ratio:.2f}x more top-5% molecules than random selection at a 20% evaluation budget.
+- Built a message-passing GNN ensemble in PyTorch for molecular property prediction, reaching {esol_rmse:.3f} RMSE on scaffold-split ESOL vs. {esol_rf_desc:.3f} for a random forest on the same Morgan fingerprints and RDKit descriptors ({esol_rf:.3f} for fingerprints alone).
+- Predicted lipophilicity on a Bemis-Murcko scaffold split with ensemble test RMSE {lipo_rmse:.3f} vs. {lipo_rf_desc:.3f} for the fingerprint-plus-descriptor random forest.
+- Ran an active-learning screening loop whose {best} acquisition recovered {ratio:.2f}x more top-5% molecules than random selection at a 20% evaluation budget.
 - Quantified prediction uncertainty with a 5-model deep ensemble (ESOL 90% interval coverage {esol_cov:.3f}, lipophilicity {lipo_cov:.3f}) to choose which molecules to evaluate next.
 """
     assert_plain_language(text)

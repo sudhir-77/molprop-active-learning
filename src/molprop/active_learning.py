@@ -15,6 +15,8 @@ import pandas as pd
 
 from molprop.metrics import fraction_count, mark_top_fraction
 
+STRATEGY_ORDER = ("random", "greedy", "ucb", "ei")
+
 
 def norm_cdf(z: np.ndarray) -> np.ndarray:
     values = np.asarray(z, dtype=np.float64)
@@ -143,7 +145,7 @@ def run_pool_simulation(
     rows: list[dict] = []
     id_to_pos = {mol_id: index for index, mol_id in enumerate(ids)}
     for seed in seeds:
-        rng = np.random.RandomState(int(seed))
+        rng = np.random.default_rng(int(seed))
         perm = rng.permutation(len(ids))
         init_ids = [ids[int(index)] for index in perm[:init_n]]
         random_queue = [ids[int(index)] for index in perm[init_n:]]
@@ -319,11 +321,41 @@ def recoveries_at_budget(
             raise ValueError(f"{strategy} seed {seed} never reaches the budget")
         hit_count = len(set(chosen) & top_ids)
         recoveries.setdefault(str(strategy), {})[int(seed)] = hit_count / len(top_ids)
-    return recoveries
+    ordered: dict[str, dict[int, float]] = {}
+    for strategy in _strategy_order(recoveries):
+        per_seed = recoveries[strategy]
+        ordered[strategy] = {seed: per_seed[seed] for seed in sorted(per_seed)}
+    return ordered
+
+
+def _strategy_order(mapping: dict) -> list[str]:
+    present = {str(name) for name in mapping}
+    ordered = [name for name in STRATEGY_ORDER if name in present]
+    ordered.extend(sorted(present.difference(ordered)))
+    return ordered
+
+
+def ratios_vs_random(means: dict[str, float]) -> dict[str, float]:
+    if "random" not in means:
+        raise ValueError("random acquisition is required")
+    random_mean = float(means["random"])
+    ratios: dict[str, float] = {}
+    for name in _strategy_order(means):
+        if name == "random":
+            ratios[name] = 1.0
+        elif random_mean <= 1e-12:
+            ratios[name] = float("inf")
+        else:
+            ratios[name] = float(means[name] / random_mean)
+    return ratios
 
 
 def best_strategy_ratio(recoveries: dict[str, dict[int, float]]) -> tuple[str, float, dict[str, float]]:
-    means = {strategy: float(np.mean(list(per_seed.values()))) for strategy, per_seed in recoveries.items()}
+    means = {}
+    for strategy in _strategy_order(recoveries):
+        per_seed = recoveries[strategy]
+        values = [per_seed[seed] for seed in sorted(per_seed)]
+        means[strategy] = float(np.mean(values))
     if "random" not in means:
         raise ValueError("random acquisition is required")
     informed = [name for name in ("greedy", "ucb", "ei") if name in means]
@@ -331,9 +363,5 @@ def best_strategy_ratio(recoveries: dict[str, dict[int, float]]) -> tuple[str, f
         raise ValueError("at least one informed strategy is required")
     priority = {"greedy": 2, "ucb": 1, "ei": 0}
     best = max(informed, key=lambda name: (means[name], priority[name]))
-    random_mean = means["random"]
-    if random_mean <= 1e-12:
-        ratio = float("inf")
-    else:
-        ratio = means[best] / random_mean
+    ratio = ratios_vs_random(means)[best]
     return best, float(ratio), means

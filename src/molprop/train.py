@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import math
+import os
 import random
 
 import numpy as np
@@ -15,17 +16,34 @@ from molprop.featurize import MolGraph
 from molprop.metrics import rmse
 from molprop.model import DMPNN, collate_graphs
 
+TORCH_THREADS = 4
 
-def seed_everything(seed: int) -> None:
+
+def configure_runtime(num_threads: int = TORCH_THREADS) -> int:
+    """Pin thread counts and turn on deterministic PyTorch kernels."""
+    text = str(num_threads)
+    os.environ["OMP_NUM_THREADS"] = text
+    os.environ["MKL_NUM_THREADS"] = text
+    os.environ["OPENBLAS_NUM_THREADS"] = text
+    torch.set_num_threads(num_threads)
+    try:
+        torch.set_num_interop_threads(1)
+    except RuntimeError:
+        pass
+    torch.use_deterministic_algorithms(True)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+    return int(torch.get_num_threads())
+
+
+def seed_everything(seed: int) -> np.random.Generator:
+    """Reset Python, NumPy, and PyTorch RNGs and return a local Generator."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
-
-
-def stack_fingerprints(graphs: list[MolGraph]) -> np.ndarray:
-    if not graphs:
-        raise ValueError("no graphs to stack")
-    return np.stack([graph.fp for graph in graphs]).astype(np.float64)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    return np.random.default_rng(seed)
 
 
 def predict(model: nn.Module, graphs: list[MolGraph], batch_size: int, device: torch.device) -> np.ndarray:
@@ -67,7 +85,7 @@ def train_regressor(
         raise ValueError("train graphs and labels differ in length")
     if len(train_graphs) == 0:
         raise ValueError("training set is empty")
-    seed_everything(seed)
+    rng = seed_everything(seed)
     model.to(device)
     optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=weight_decay)
     y_train = np.asarray(y_train, dtype=np.float64)
@@ -80,7 +98,6 @@ def train_regressor(
     best_state = copy.deepcopy(model.state_dict())
     best_val = float("inf")
     stale = 0
-    rng = np.random.RandomState(seed)
     prefix = f"{log_prefix} " if log_prefix else ""
     for epoch in range(epochs):
         model.train()
@@ -127,7 +144,7 @@ def train_regressor(
     return model
 
 
-def _make_model(example: MolGraph, cfg: RunConfig) -> DMPNN:
+def _make_model(example: MolGraph, cfg: RunConfig, use_descriptors: bool = True) -> DMPNN:
     return DMPNN(
         atom_dim=int(example.atom_x.shape[1]),
         bond_dim=int(example.bond_x.shape[1]),
@@ -136,6 +153,7 @@ def _make_model(example: MolGraph, cfg: RunConfig) -> DMPNN:
         fp_dim=int(example.fp.shape[0]),
         desc_dim=int(example.desc.shape[0]),
         dropout=cfg.dropout,
+        use_descriptors=use_descriptors,
     )
 
 
@@ -156,6 +174,7 @@ def train_ensemble(
     fixed_mean: float | None = None,
     fixed_scale: float | None = None,
     log_prefix: str = "",
+    use_descriptors: bool = True,
 ) -> tuple[np.ndarray, np.ndarray, list[dict], float, float]:
     """Train one model per seed and return mean, std, and CPU state dicts on the original scale.
 
@@ -182,9 +201,10 @@ def train_ensemble(
     states = []
     for index, seed in enumerate(seeds):
         seed_everything(int(seed))
-        model = _make_model(train_graphs[0], cfg).to(device)
+        model = _make_model(train_graphs[0], cfg, use_descriptors=use_descriptors).to(device)
         if warm_states is not None:
-            model.load_state_dict({key: value.to(device) for key, value in warm_states[index].items()})
+            state = {key: value.to(device) for key, value in sorted(warm_states[index].items())}
+            model.load_state_dict(state)
         train_regressor(
             model,
             train_graphs,
@@ -204,7 +224,9 @@ def train_ensemble(
         )
         raw = predict(model, pred_graphs, cfg.batch_size, device)
         member_preds.append(raw * y_scale + y_mean)
-        states.append({key: value.detach().cpu().clone() for key, value in model.state_dict().items()})
+        states.append(
+            {key: value.detach().cpu().clone() for key, value in sorted(model.state_dict().items())}
+        )
     stacked = np.stack(member_preds, axis=0)
     mean = stacked.mean(axis=0)
     if stacked.shape[0] == 1:
@@ -222,11 +244,12 @@ def ensemble_predict_from_states(
     y_scale: float,
     cfg: RunConfig,
     device: torch.device,
+    use_descriptors: bool = True,
 ) -> tuple[np.ndarray, np.ndarray]:
     preds = []
     for state in states:
-        model = _make_model(example_graph, cfg).to(device)
-        model.load_state_dict({key: value.to(device) for key, value in state.items()})
+        model = _make_model(example_graph, cfg, use_descriptors=use_descriptors).to(device)
+        model.load_state_dict({key: value.to(device) for key, value in sorted(state.items())})
         raw = predict(model, graphs, cfg.batch_size, device)
         preds.append(raw * y_scale + y_mean)
     stacked = np.stack(preds, axis=0)

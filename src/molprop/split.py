@@ -26,6 +26,7 @@ def scaffold_split(
     groups: dict[str, list[int]] = defaultdict(list)
     for index, scaffold in enumerate(scaffolds):
         groups[scaffold].append(index)
+    # First-seen order is fixed by the table, so this draw does not depend on hash seed.
     rng = np.random.RandomState(seed)
     tie_break = {scaffold: float(rng.rand()) for scaffold in groups}
     ordered = sorted(groups, key=lambda scaffold: (-len(groups[scaffold]), tie_break[scaffold]))
