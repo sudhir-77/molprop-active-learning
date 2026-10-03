@@ -1,0 +1,215 @@
+{
+  "project": "molprop-active-learning",
+  "success_criteria": [
+    {
+      "name": "ESOL test RMSE (scaffold split)",
+      "value": 0.8949842623980286,
+      "op": "<=",
+      "threshold": 0.9,
+      "threshold_high": null,
+      "passed": true
+    },
+    {
+      "name": "Lipophilicity test RMSE (scaffold split)",
+      "value": 0.783538147748005,
+      "op": "<=",
+      "threshold": 0.85,
+      "threshold_high": null,
+      "passed": true
+    },
+    {
+      "name": "90% prediction-interval coverage",
+      "value": 0.9077960387694901,
+      "op": "between",
+      "threshold": 0.8,
+      "threshold_high": 0.97,
+      "passed": true
+    },
+    {
+      "name": "Top-5% hit recovery at 20% budget (Lipophilicity pool)",
+      "value": 2.357142857142857,
+      "op": ">=",
+      "threshold": 1.5,
+      "threshold_high": null,
+      "passed": true
+    }
+  ],
+  "metrics": {
+    "esol": {
+      "gnn_ensemble": {
+        "test_rmse": 0.8949842623980286,
+        "coverage_90": 0.9203539823008849,
+        "val_rmse": 0.8631664021196636,
+        "std_scale": 5.509257042629344
+      },
+      "rf_baseline": {
+        "test_rmse": 1.8213411971826348,
+        "val_rmse": 1.5226576644157845
+      },
+      "dropped_smiles": 0
+    },
+    "lipophilicity": {
+      "gnn_ensemble": {
+        "test_rmse": 0.783538147748005,
+        "coverage_90": 0.8952380952380953,
+        "val_rmse": 0.7930660606169695,
+        "std_scale": 6.916803536471995
+      },
+      "rf_baseline": {
+        "test_rmse": 0.9421855774449501,
+        "val_rmse": 0.9468145765107909
+      },
+      "dropped_smiles": 0
+    },
+    "active_learning": {
+      "budget_fraction": 0.2,
+      "pool_size": 3780,
+      "pool_excludes_test_split": true,
+      "hit_recovery_mean": {
+        "ei": 0.32063492063492055,
+        "greedy": 0.44973544973544977,
+        "random": 0.1925925925925926,
+        "ucb": 0.45396825396825397
+      },
+      "hit_recovery_by_seed": {
+        "ei": {
+          "0": 0.3386243386243386,
+          "1": 0.2857142857142857,
+          "2": 0.36507936507936506,
+          "3": 0.2857142857142857,
+          "4": 0.328042328042328
+        },
+        "greedy": {
+          "0": 0.5026455026455027,
+          "1": 0.38095238095238093,
+          "2": 0.41798941798941797,
+          "3": 0.42857142857142855,
+          "4": 0.5185185185185185
+        },
+        "random": {
+          "0": 0.1693121693121693,
+          "1": 0.21693121693121692,
+          "2": 0.14285714285714285,
+          "3": 0.20105820105820105,
+          "4": 0.2328042328042328
+        },
+        "ucb": {
+          "0": 0.49206349206349204,
+          "1": 0.42328042328042326,
+          "2": 0.41798941798941797,
+          "3": 0.41798941798941797,
+          "4": 0.5185185185185185
+        }
+      },
+      "best_strategy": "ucb",
+      "best_over_random": 2.357142857142857,
+      "kappa": 1.0
+    },
+    "learning_curve": [
+      {
+        "dataset": "esol",
+        "model": "gnn",
+        "train_size": 226,
+        "test_rmse": 1.0600828141853826
+      },
+      {
+        "dataset": "esol",
+        "model": "rf_baseline",
+        "train_size": 226,
+        "test_rmse": 2.207609911995997
+      },
+      {
+        "dataset": "esol",
+        "model": "gnn",
+        "train_size": 451,
+        "test_rmse": 0.9427058008021816
+      },
+      {
+        "dataset": "esol",
+        "model": "rf_baseline",
+        "train_size": 451,
+        "test_rmse": 1.9659789052833965
+      },
+      {
+        "dataset": "esol",
+        "model": "gnn",
+        "train_size": 902,
+        "test_rmse": 0.9189829933642326
+      },
+      {
+        "dataset": "esol",
+        "model": "rf_baseline",
+        "train_size": 902,
+        "test_rmse": 1.8170231800971568
+      },
+      {
+        "dataset": "lipophilicity",
+        "model": "gnn",
+        "train_size": 840,
+        "test_rmse": 0.9377592263300448
+      },
+      {
+        "dataset": "lipophilicity",
+        "model": "rf_baseline",
+        "train_size": 840,
+        "test_rmse": 1.0304708375093377
+      },
+      {
+        "dataset": "lipophilicity",
+        "model": "gnn",
+        "train_size": 1680,
+        "test_rmse": 0.8978440741868742
+      },
+      {
+        "dataset": "lipophilicity",
+        "model": "rf_baseline",
+        "train_size": 1680,
+        "test_rmse": 0.9936625164743024
+      },
+      {
+        "dataset": "lipophilicity",
+        "model": "gnn",
+        "train_size": 3360,
+        "test_rmse": 0.8076388450038364
+      },
+      {
+        "dataset": "lipophilicity",
+        "model": "rf_baseline",
+        "train_size": 3360,
+        "test_rmse": 0.9435908661694582
+      }
+    ]
+  },
+  "baseline": {
+    "esol_rf_test_rmse": 1.8213411971826348,
+    "lipophilicity_rf_test_rmse": 0.9421855774449501,
+    "active_learning_random_hit_recovery": 0.1925925925925926
+  },
+  "splits": {
+    "esol": {
+      "train": 902,
+      "val": 113,
+      "test": 113
+    },
+    "lipophilicity": {
+      "train": 3360,
+      "val": 420,
+      "test": 420
+    }
+  },
+  "seeds": [
+    0,
+    1,
+    2,
+    3,
+    4
+  ],
+  "hardware": {
+    "cpu": "Intel64 Family 6 Model 141 Stepping 1, GenuineIntel",
+    "ram_gb": 15.73,
+    "gpu": null,
+    "python": "3.12.10",
+    "os": "Windows-11-10.0.26200-SP0"
+  },
+  "runtime_seconds": 637.91
+}

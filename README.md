@@ -73,5 +73,23 @@ python -m pytest --cov=molprop --cov-report=term-missing
 ## Results
 
 <!-- RESULTS_START -->
-Results are filled in by `python run.py` from `results/metrics.json`.
+All success criteria recorded in `results/metrics.json` passed.
+
+| Criterion | Value | Rule | Passed |
+|---|---:|---|---|
+| ESOL test RMSE (scaffold split) | 0.8950 | <= 0.9 | True |
+| Lipophilicity test RMSE (scaffold split) | 0.7835 | <= 0.85 | True |
+| 90% prediction-interval coverage | 0.9078 | between 0.8 and 0.97 | True |
+| Top-5% hit recovery at 20% budget (Lipophilicity pool) | 2.3571 | >= 1.5 | True |
+
+| Dataset | GNN ensemble test RMSE | RF baseline test RMSE | 90% interval coverage |
+|---|---:|---:|---:|
+| esol | 0.8950 | 1.8213 | 0.9204 |
+| lipophilicity | 0.7835 | 0.9422 | 0.8952 |
+
+Active learning at a 20% budget, mean over seeds: ei 0.3206, greedy 0.4497, random 0.1926, ucb 0.4540. Best strategy ucb is 2.3571 times random.
+
+Runtime 637.9 seconds.
+
+Plots: `results/plots/test_rmse_vs_train_size.png`, `results/plots/hit_recovery_vs_budget.png`.
 <!-- RESULTS_END -->

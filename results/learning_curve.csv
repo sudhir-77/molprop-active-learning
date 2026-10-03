@@ -1,0 +1,13 @@
+dataset,model,train_size,test_rmse
+esol,gnn,226,1.0600828141853826
+esol,rf_baseline,226,2.207609911995997
+esol,gnn,451,0.9427058008021816
+esol,rf_baseline,451,1.9659789052833965
+esol,gnn,902,0.9189829933642326
+esol,rf_baseline,902,1.8170231800971568
+lipophilicity,gnn,840,0.9377592263300447
+lipophilicity,rf_baseline,840,1.0304708375093377
+lipophilicity,gnn,1680,0.8978440741868742
+lipophilicity,rf_baseline,1680,0.9936625164743023
+lipophilicity,gnn,3360,0.8076388450038364
+lipophilicity,rf_baseline,3360,0.9435908661694582
